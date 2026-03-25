@@ -5,6 +5,7 @@ from html import escape
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -157,41 +158,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Я работаю.\n\n"
             "Команды:\n"
             "/all текст — отметить всех в группе\n"
-            "/join — вручную зарегистрироваться в списке\n"
             "/list — показать, кого я знаю в этой группе"
         )
 
 
-async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await register_user_from_message(update, context)
-    if update.effective_message:
-        await update.effective_message.reply_text("Ок, добавил тебя в список для /all")
-
-
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not chat or chat.type not in ("group", "supergroup"):
-        if update.effective_message:
-            await update.effective_message.reply_text("Эта команда работает только в группе.")
-        return
-
-    members = get_active_members(chat.id)
-    if not members:
-        await update.effective_message.reply_text(
-            "Пока список пуст. Пусть каждый напишет что-нибудь в группу или выполнит /join"
-        )
-        return
-
-    mentions = [
-        build_mention(user_id, username, first_name, last_name)
-        for user_id, username, first_name, last_name in members
-    ]
-
-    text = "Я знаю таких участников:\n" + "\n".join(f"• {m}" for m in mentions)
-    await update.effective_message.reply_html(text)
-
-
-async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     message = update.effective_message
 
@@ -204,42 +175,100 @@ async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     members = get_active_members(chat.id)
     if not members:
-        await message.reply_text(
-            "Я пока никого не знаю. Пусть участники напишут что-нибудь в чат или выполнят /join"
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Пока список пуст. Пусть кто-нибудь напишет сообщение в группу."
         )
         return
 
-    payload = message.text_html.removeprefix("/all").strip() if message.text_html else ""
+    mentions = [
+        build_mention(user_id, username, first_name, last_name)
+        for user_id, username, first_name, last_name in members
+    ]
+
+    text = "Я знаю таких участников:\n" + "\n".join(f"• {m}" for m in mentions)
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not chat or not message:
+        return
+
+    if chat.type not in ("group", "supergroup"):
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Эта команда работает только в группе."
+        )
+        return
+
+    members = get_active_members(chat.id)
+    if not members:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Я пока никого не знаю. Пусть участники сначала напишут что-нибудь в чат."
+        )
+        return
+
+    raw_text = message.text or ""
+    payload = raw_text[len("/all"):].strip() if raw_text.startswith("/all") else ""
+
     mentions = [
         build_mention(user_id, username, first_name, last_name)
         for user_id, username, first_name, last_name in members
     ]
 
     header = " ".join(mentions)
-    final_text = header if not payload else f"{header}\n\n{payload}"
+    final_text = header if not payload else f"{header} {escape(payload)}"
 
-    # Чтобы не упереться в лимит длины, режем по кускам
     max_len = 3500
     if len(final_text) <= max_len:
-        await message.reply_text(final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        return
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=final_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    else:
+        chunks = []
+        current = ""
 
-    chunks = []
-    current = ""
-    for mention in mentions:
-        candidate = (current + " " + mention).strip()
-        if len(candidate) > max_len:
+        for mention in mentions:
+            candidate = (current + " " + mention).strip()
+            if len(candidate) > max_len:
+                if current:
+                    chunks.append(current)
+                current = mention
+            else:
+                current = candidate
+
+        if current:
             chunks.append(current)
-            current = mention
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
 
-    for i, chunk in enumerate(chunks):
-        if i == len(chunks) - 1 and payload:
-            chunk = f"{chunk}\n\n{payload}"
-        await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        for i, chunk in enumerate(chunks):
+            if i == len(chunks) - 1 and payload:
+                chunk = f"{chunk} {escape(payload)}"
+
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=chunk,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+
+    # Удаляем команду пользователя
+    try:
+        await message.delete()
+    except (Forbidden, BadRequest):
+        # Если у бота нет права удалять сообщения — просто пропускаем
+        pass
 
 
 def main():
@@ -252,7 +281,6 @@ def main():
     app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("all", all_cmd))
 
